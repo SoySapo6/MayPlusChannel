@@ -1,424 +1,239 @@
 const express = require('express');
-const https = require('https');
-const http = require('http');
-const net = require('net');
-const { URL } = require('url');
-
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
 const app = express();
-const PORT = process.env.PORT || 3000;
 
 // Lista de videos de YouTube
-const videoIds = [
-    'BR3NFEXuSv0',
-    'XOt3Rgs-tt0', 
-    'nD2TZahdAJY',
-    'lKgDhWCEfQo',
-    '4uwZ-80XAqw',
-    'NRQ7Kv7-8Hs',
-    'rzDrGSWteZg'
+const videoUrls = [
+    'https://youtu.be/BR3NFEXuSv0?si=mSCaAzM4r6NjbC5L',
+    'https://youtu.be/XOt3Rgs-tt0?si=RU86-8VqLKJ3TH60',
+    'https://youtu.be/nD2TZahdAJY?si=3DfZBqXeEhAsgQH8',
+    'https://youtu.be/lKgDhWCEfQo?si=6mD0EbDePrs_EAiI',
+    'https://youtu.be/4uwZ-80XAqw?si=b62G5uNlWCdHBcnT',
+    'https://youtu.be/NRQ7Kv7-8Hs?si=kFxtzMTvOwVFRx84',
+    'https://youtu.be/rzDrGSWteZg?si=CqsE3ffZU5H0Mnyg'
 ];
 
-// Configuración del stream
-const SRT_CONFIG = {
-    host: 'rtmp.livepeer.com',
-    port: 2935,
-    streamId: '95e4-urol-igfh-cehi'
-};
+const SRT_ENDPOINT = 'srt://rtmp.livepeer.com:2935?streamid=95e4-urol-igfh-cehi';
+const DOWNLOAD_DIR = './downloads';
 
-let currentVideoIndex = 0;
-let isStreaming = false;
-let streamSocket = null;
-let stats = {
-    totalVideos: 0,
-    errors: 0,
-    connections: 0,
-    startTime: Date.now()
-};
+// Crear directorio de descargas si no existe
+if (!fs.existsSync(DOWNLOAD_DIR)) {
+    fs.mkdirSync(DOWNLOAD_DIR);
+}
 
-// Estrategia 1: Usar APIs alternativas para obtener URLs de video
-const INVIDIOUS_INSTANCES = [
-    'invidio.us',
-    'yewtu.be',
-    'inv.riverside.rocks',
-    'invidious.snopyta.org'
-];
+// Función para extraer video ID de URL de YouTube
+function extractVideoId(url) {
+    const match = url.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=)([^&\n?#]+)/);
+    return match ? match[1] : null;
+}
 
-// Estrategia 2: URLs de video de prueba (si no funciona YouTube)
-const FALLBACK_STREAMS = [
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4',
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerMeltdowns.mp4'
-];
-
-// Función para obtener información del video usando APIs alternativas
-async function getVideoInfo(videoId) {
-    console.log(`🔍 Buscando info para video: ${videoId}`);
-    
-    // Intentar con diferentes instancias de Invidious
-    for (const instance of INVIDIOUS_INSTANCES) {
-        try {
-            console.log(`Probando instancia: ${instance}`);
+// Función para descargar video usando la API de Vreden
+async function downloadVideo(youtubeUrl) {
+    try {
+        console.log(`Descargando: ${youtubeUrl}`);
+        
+        const apiUrl = `https://api.vreden.my.id/api/ytmp4?url=${encodeURIComponent(youtubeUrl)}`;
+        const response = await axios.get(apiUrl);
+        
+        if (response.data.status === 200 && response.data.result.download.status) {
+            const videoData = response.data.result;
+            const downloadUrl = videoData.download.url;
+            const filename = `${videoData.metadata.videoId}.mp4`;
+            const filepath = path.join(DOWNLOAD_DIR, filename);
             
-            const response = await fetchWithTimeout(`https://${instance}/api/v1/videos/${videoId}`, {
-                timeout: 10000,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
+            // Descargar el archivo de video
+            const videoResponse = await axios({
+                method: 'GET',
+                url: downloadUrl,
+                responseType: 'stream'
             });
             
-            if (response.ok) {
-                const data = await response.json();
-                
-                // Buscar formato de video adecuado
-                const videoFormat = data.formatStreams?.find(f => 
-                    f.container === 'mp4' && f.resolution && f.url
-                ) || data.adaptiveFormats?.find(f => 
-                    f.container === 'mp4' && f.type?.includes('video') && f.url
-                );
-                
-                if (videoFormat) {
-                    return {
-                        title: data.title,
-                        duration: data.lengthSeconds,
-                        videoUrl: videoFormat.url,
-                        source: 'invidious',
-                        instance: instance
-                    };
-                }
-            }
-        } catch (error) {
-            console.log(`❌ Error con ${instance}: ${error.message}`);
-            continue;
-        }
-    }
-    
-    // Fallback: usar videos de prueba
-    console.log('🔄 Usando video de fallback');
-    const fallbackIndex = Math.floor(Math.random() * FALLBACK_STREAMS.length);
-    return {
-        title: `Video de prueba ${videoId}`,
-        duration: 300,
-        videoUrl: FALLBACK_STREAMS[fallbackIndex],
-        source: 'fallback'
-    };
-}
-
-// Función auxiliar para fetch con timeout
-async function fetchWithTimeout(url, options = {}) {
-    const { timeout = 8000 } = options;
-    
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    
-    try {
-        const response = await fetch(url, {
-            ...options,
-            signal: controller.signal
-        });
-        clearTimeout(id);
-        return response;
-    } catch (error) {
-        clearTimeout(id);
-        throw error;
-    }
-}
-
-// Función para hacer streaming del video
-async function streamVideo(videoInfo) {
-    return new Promise((resolve, reject) => {
-        console.log(`🎬 Iniciando stream: ${videoInfo.title}`);
-        console.log(`📺 Fuente: ${videoInfo.source}`);
-        console.log(`⏱️ Duración: ${videoInfo.duration}s`);
-        
-        // Conectar al servidor SRT
-        streamSocket = net.createConnection(SRT_CONFIG.port, SRT_CONFIG.host, () => {
-            console.log(`✅ Conectado a SRT: ${SRT_CONFIG.host}:${SRT_CONFIG.port}`);
-            stats.connections++;
+            const writer = fs.createWriteStream(filepath);
+            videoResponse.data.pipe(writer);
             
-            // Descargar y transmitir el video
-            streamVideoContent(videoInfo.videoUrl, streamSocket, videoInfo.duration, resolve, reject);
+            return new Promise((resolve, reject) => {
+                writer.on('finish', () => {
+                    console.log(`Video descargado: ${filename}`);
+                    resolve({
+                        filepath,
+                        metadata: videoData.metadata
+                    });
+                });
+                writer.on('error', reject);
+            });
+        } else {
+            throw new Error('Error en la API de Vreden');
+        }
+    } catch (error) {
+        console.error(`Error descargando ${youtubeUrl}:`, error.message);
+        return null;
+    }
+}
+
+// Función para transmitir video usando node-ffmpeg (alternativa a FFmpeg binario)
+async function streamVideo(videoPath) {
+    return new Promise((resolve, reject) => {
+        console.log(`Transmitiendo: ${videoPath}`);
+        
+        // Usar ffmpeg a través de node (requiere tener ffmpeg instalado)
+        // Para Render, puedes usar alternativas como GStreamer o crear un contenedor personalizado
+        const ffmpeg = spawn('ffmpeg', [
+            '-re',                          // Leer entrada a velocidad nativa
+            '-i', videoPath,               // Archivo de entrada
+            '-c:v', 'libx264',             // Codec de video
+            '-preset', 'ultrafast',        // Preset rápido
+            '-tune', 'zerolatency',        // Optimizar para latencia baja
+            '-c:a', 'aac',                 // Codec de audio
+            '-b:v', '2500k',               // Bitrate de video
+            '-b:a', '128k',                // Bitrate de audio
+            '-f', 'mpegts',                // Formato de salida
+            SRT_ENDPOINT                   // Destino SRT
+        ]);
+        
+        ffmpeg.stdout.on('data', (data) => {
+            console.log(`FFmpeg stdout: ${data}`);
         });
         
-        streamSocket.on('error', (error) => {
-            console.error(`❌ Error SRT: ${error.message}`);
-            stats.errors++;
+        ffmpeg.stderr.on('data', (data) => {
+            console.log(`FFmpeg stderr: ${data}`);
+        });
+        
+        ffmpeg.on('close', (code) => {
+            console.log(`FFmpeg terminó con código: ${code}`);
+            resolve(code);
+        });
+        
+        ffmpeg.on('error', (error) => {
+            console.error('Error en FFmpeg:', error);
             reject(error);
         });
+    });
+}
+
+// Función alternativa usando GStreamer (más compatible con Render)
+async function streamVideoGStreamer(videoPath) {
+    return new Promise((resolve, reject) => {
+        console.log(`Transmitiendo con GStreamer: ${videoPath}`);
         
-        streamSocket.on('close', () => {
-            console.log('🔌 Conexión SRT cerrada');
-            resolve();
+        const gst = spawn('gst-launch-1.0', [
+            'filesrc', `location=${videoPath}`,
+            '!', 'decodebin',
+            '!', 'videoconvert',
+            '!', 'x264enc', 'tune=zerolatency', 'bitrate=2500',
+            '!', 'h264parse',
+            '!', 'mpegtsmux',
+            '!', 'srtserversink', `uri=${SRT_ENDPOINT}`
+        ]);
+        
+        gst.stdout.on('data', (data) => {
+            console.log(`GStreamer: ${data}`);
+        });
+        
+        gst.stderr.on('data', (data) => {
+            console.log(`GStreamer stderr: ${data}`);
+        });
+        
+        gst.on('close', (code) => {
+            console.log(`GStreamer terminó con código: ${code}`);
+            resolve(code);
+        });
+        
+        gst.on('error', (error) => {
+            console.error('Error en GStreamer:', error);
+            reject(error);
         });
     });
 }
 
-// Función para descargar y transmitir contenido de video
-function streamVideoContent(videoUrl, socket, duration, resolve, reject) {
-    console.log(`📥 Descargando video desde: ${videoUrl}`);
-    
-    const url = new URL(videoUrl);
-    const httpModule = url.protocol === 'https:' ? https : http;
-    
-    const request = httpModule.request(videoUrl, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Range': 'bytes=0-'
-        }
-    }, (response) => {
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-            console.log(`📡 Transmitiendo datos (${response.statusCode})`);
-            
-            // Pipe el contenido del video al socket SRT
-            response.pipe(socket, { end: false });
-            
-            response.on('end', () => {
-                console.log('✅ Descarga completada');
-                socket.end();
-                resolve();
-            });
-            
-        } else if (response.statusCode >= 300 && response.statusCode < 400) {
-            // Manejar redirecciones
-            const location = response.headers.location;
-            if (location) {
-                console.log(`🔄 Redirigiendo a: ${location}`);
-                streamVideoContent(location, socket, duration, resolve, reject);
-                return;
-            }
-        } else {
-            console.error(`❌ Error HTTP: ${response.statusCode}`);
-            reject(new Error(`HTTP ${response.statusCode}`));
-        }
-    });
-    
-    request.on('error', (error) => {
-        console.error(`❌ Error de descarga: ${error.message}`);
-        stats.errors++;
-        reject(error);
-    });
-    
-    // Timeout para videos muy largos
-    request.setTimeout((duration + 30) * 1000, () => {
-        console.log('⏰ Timeout de descarga');
-        request.destroy();
-        resolve();
-    });
-    
-    request.end();
-}
-
-// Función principal de streaming
+// Función principal para transmitir playlist
 async function startStreaming() {
-    if (isStreaming) {
-        console.log('⚠️ Stream ya está activo');
-        return;
-    }
+    console.log('Iniciando transmisión de playlist...');
     
-    isStreaming = true;
-    stats.startTime = Date.now();
-    console.log('🚀 Iniciando streaming loop...');
+    let currentIndex = 0;
     
-    while (isStreaming) {
-        const videoId = videoIds[currentVideoIndex];
-        console.log(`\n🎯 Video ${currentVideoIndex + 1}/${videoIds.length}: ${videoId}`);
+    while (true) {
+        const currentUrl = videoUrls[currentIndex];
+        console.log(`\n--- Procesando video ${currentIndex + 1}/${videoUrls.length} ---`);
         
-        try {
-            // Obtener información del video
-            const videoInfo = await getVideoInfo(videoId);
-            if (!videoInfo) {
-                console.error('❌ No se pudo obtener info del video');
-                nextVideo();
-                continue;
+        // Descargar video
+        const videoInfo = await downloadVideo(currentUrl);
+        
+        if (videoInfo) {
+            try {
+                // Intentar transmitir con FFmpeg primero
+                await streamVideo(videoInfo.filepath);
+            } catch (error) {
+                console.log('FFmpeg falló, intentando con GStreamer...');
+                try {
+                    await streamVideoGStreamer(videoInfo.filepath);
+                } catch (gstError) {
+                    console.error('Error en ambos métodos de streaming:', gstError);
+                }
             }
             
-            // Transmitir el video
-            await streamVideo(videoInfo);
-            stats.totalVideos++;
-            
-        } catch (error) {
-            console.error(`❌ Error en streaming: ${error.message}`);
-            stats.errors++;
+            // Limpiar archivo después de transmitir
+            try {
+                fs.unlinkSync(videoInfo.filepath);
+                console.log(`Archivo eliminado: ${videoInfo.filepath}`);
+            } catch (err) {
+                console.error('Error eliminando archivo:', err);
+            }
         }
         
-        // Siguiente video
-        nextVideo();
+        // Pasar al siguiente video (loop infinito)
+        currentIndex = (currentIndex + 1) % videoUrls.length;
         
-        // Pausa entre videos
-        if (isStreaming) {
-            console.log('⏸️ Pausa entre videos (5s)...');
-            await new Promise(resolve => setTimeout(resolve, 5000));
-        }
+        // Pequeña pausa entre videos
+        await new Promise(resolve => setTimeout(resolve, 2000));
     }
-    
-    console.log('🛑 Streaming terminado');
 }
-
-// Función para cambiar al siguiente video
-function nextVideo() {
-    currentVideoIndex = (currentVideoIndex + 1) % videoIds.length;
-    console.log(`➡️ Siguiente: ${videoIds[currentVideoIndex]}`);
-}
-
-// Middleware
-app.use(express.json());
 
 // Rutas de la API
 app.get('/', (req, res) => {
-    const uptime = Date.now() - stats.startTime;
     res.json({
-        status: isStreaming ? 'streaming' : 'stopped',
-        currentVideo: {
-            index: currentVideoIndex + 1,
-            id: videoIds[currentVideoIndex],
-            total: videoIds.length
-        },
-        stats: {
-            ...stats,
-            uptime: Math.floor(uptime / 1000),
-            successRate: stats.totalVideos / (stats.totalVideos + stats.errors) || 0
-        },
-        server: 'alternative-streamer'
+        status: 'YouTube to SRT Streaming Server',
+        endpoint: SRT_ENDPOINT,
+        videos: videoUrls.length,
+        message: 'Servidor funcionando correctamente'
     });
 });
 
-app.post('/start', (req, res) => {
-    if (isStreaming) {
-        return res.json({ 
-            success: false, 
-            message: 'Stream ya está activo' 
-        });
-    }
-    
-    console.log('🎬 Iniciando stream por API...');
-    startStreaming().catch(err => {
-        console.error('Error en stream:', err);
-        isStreaming = false;
-    });
-    
-    res.json({ 
-        success: true, 
-        message: 'Stream iniciado' 
-    });
+app.get('/start', async (req, res) => {
+    res.json({ message: 'Iniciando transmisión...' });
+    startStreaming().catch(console.error);
 });
 
-app.post('/stop', (req, res) => {
-    console.log('🛑 Deteniendo stream...');
-    isStreaming = false;
-    
-    if (streamSocket) {
-        streamSocket.destroy();
-        streamSocket = null;
-    }
-    
-    res.json({ 
-        success: true, 
-        message: 'Stream detenido' 
-    });
-});
-
-app.post('/next', (req, res) => {
-    console.log('⏭️ Saltando video...');
-    
-    if (streamSocket) {
-        streamSocket.destroy();
-    }
-    
-    nextVideo();
-    
+app.get('/status', (req, res) => {
     res.json({
-        success: true,
-        message: 'Cambiado al siguiente video',
-        next: {
-            index: currentVideoIndex + 1,
-            id: videoIds[currentVideoIndex]
-        }
+        status: 'running',
+        downloadDir: DOWNLOAD_DIR,
+        endpoint: SRT_ENDPOINT,
+        videos: videoUrls
     });
-});
-
-app.get('/playlist', (req, res) => {
-    res.json({
-        videos: videoIds.map((id, index) => ({
-            index: index + 1,
-            id: id,
-            url: `https://youtu.be/${id}`,
-            active: index === currentVideoIndex
-        })),
-        fallbackStreams: FALLBACK_STREAMS.length
-    });
-});
-
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        memory: process.memoryUsage(),
-        uptime: process.uptime(),
-        streaming: isStreaming,
-        stats: stats
-    });
-});
-
-app.get('/test', async (req, res) => {
-    const testVideoId = videoIds[0];
-    console.log(`🧪 Probando video: ${testVideoId}`);
-    
-    try {
-        const videoInfo = await getVideoInfo(testVideoId);
-        res.json({
-            success: true,
-            videoInfo: videoInfo,
-            message: 'Test exitoso'
-        });
-    } catch (error) {
-        res.json({
-            success: false,
-            error: error.message,
-            message: 'Test falló'
-        });
-    }
 });
 
 // Iniciar servidor
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`\n🚀 Servidor alternativo en puerto ${PORT}`);
-    console.log(`📺 Videos: ${videoIds.length}`);
-    console.log(`🎯 SRT: ${SRT_CONFIG.host}:${SRT_CONFIG.port}`);
-    console.log(`🔧 Fallbacks: ${FALLBACK_STREAMS.length}`);
-    console.log('\n📡 Endpoints:');
-    console.log('  GET  / - Estado');
-    console.log('  POST /start - Iniciar');
-    console.log('  POST /stop - Detener');
-    console.log('  POST /next - Siguiente');
-    console.log('  GET  /playlist - Lista');
-    console.log('  GET  /health - Salud');
-    console.log('  GET  /test - Probar video');
-    console.log('\n🌟 Servidor listo!');
+    console.log(`Servidor ejecutándose en puerto ${PORT}`);
+    console.log(`Endpoint SRT: ${SRT_ENDPOINT}`);
+    console.log(`Videos en playlist: ${videoUrls.length}`);
+    
+    // Iniciar transmisión automáticamente
+    console.log('\nIniciando transmisión automática en 5 segundos...');
+    setTimeout(() => {
+        startStreaming().catch(console.error);
+    }, 5000);
 });
 
-// Manejo de errores
+// Manejo de errores no capturados
 process.on('uncaughtException', (error) => {
-    console.error('💥 Error crítico:', error.message);
+    console.error('Error no capturado:', error);
 });
 
-process.on('unhandledRejection', (reason) => {
-    console.error('💥 Promise rechazada:', reason);
-});
-
-// Cierre graceful
-process.on('SIGINT', () => {
-    console.log('\n👋 Cerrando servidor...');
-    isStreaming = false;
-    if (streamSocket) streamSocket.destroy();
-    process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-    console.log('\n👋 Terminando servidor...');
-    isStreaming = false;
-    if (streamSocket) streamSocket.destroy();
-    process.exit(0);
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Promesa rechazada no manejada:', reason);
 });
