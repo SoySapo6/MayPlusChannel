@@ -2,6 +2,7 @@ const express = require('express');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const ytdl = require('ytdl-core');
 
 const app = express();
 const PORT = 3000;
@@ -36,71 +37,59 @@ function sanitizeFilename(filename) {
     return filename.replace(/[^\w\s-]/g, '').replace(/\s+/g, '_');
 }
 
-// Función para descargar video con yt-dlp
-function downloadVideo(url) {
-    return new Promise((resolve, reject) => {
-        console.log(`Descargando: ${url}`);
+// Función para obtener URL de stream directo de YouTube
+async function getYouTubeStreamUrl(url) {
+    try {
+        console.log(`Obteniendo stream URL para: ${url}`);
         
-        const ytdlp = spawn('yt-dlp', [
-            '--format', 'best[height<=720]',
-            '--output', `${TEMP_DIR}/%(title)s.%(ext)s`,
-            '--no-playlist',
-            url
-        ]);
-
-        let filename = '';
+        // Validar y limpiar URL
+        const videoId = ytdl.getVideoID(url);
+        const info = await ytdl.getInfo(videoId);
         
-        ytdlp.stdout.on('data', (data) => {
-            const output = data.toString();
-            console.log(`yt-dlp stdout: ${output}`);
-            
-            // Buscar el nombre del archivo descargado
-            const match = output.match(/\[download\] Destination: (.+)/);
-            if (match) {
-                filename = match[1];
-            }
-        });
-
-        ytdlp.stderr.on('data', (data) => {
-            console.log(`yt-dlp stderr: ${data}`);
-        });
-
-        ytdlp.on('close', (code) => {
-            if (code === 0) {
-                // Si no capturamos el filename del stdout, intentar encontrarlo
-                if (!filename) {
-                    const files = fs.readdirSync(TEMP_DIR);
-                    if (files.length > 0) {
-                        filename = path.join(TEMP_DIR, files[files.length - 1]);
-                    }
-                }
-                console.log(`Video descargado exitosamente: ${filename}`);
-                resolve(filename);
-            } else {
-                reject(new Error(`yt-dlp falló con código: ${code}`));
-            }
-        });
-
-        ytdlp.on('error', (error) => {
-            reject(error);
-        });
-    });
+        // Buscar formato de video apropiado (720p o menor)
+        const formats = ytdl.filterFormats(info.formats, 'videoandaudio');
+        let selectedFormat = formats.find(format => 
+            format.height && format.height <= 720 && format.height >= 480
+        ) || formats.find(format => 
+            format.qualityLabel && format.qualityLabel.includes('720p')
+        ) || formats[0]; // Fallback al primer formato disponible
+        
+        if (!selectedFormat) {
+            throw new Error('No se encontró formato de video compatible');
+        }
+        
+        console.log(`Formato seleccionado: ${selectedFormat.qualityLabel || 'Desconocido'}`);
+        console.log(`URL de stream obtenida exitosamente`);
+        
+        return {
+            url: selectedFormat.url,
+            title: info.videoDetails.title,
+            duration: info.videoDetails.lengthSeconds
+        };
+        
+    } catch (error) {
+        console.error(`Error obteniendo stream URL: ${error.message}`);
+        throw error;
+    }
 }
 
-// Función para transmitir video via FFmpeg a SRT
-function streamVideoToSRT(videoPath) {
+// Función para transmitir video directamente desde YouTube a SRT
+function streamYouTubeToSRT(streamData) {
     return new Promise((resolve, reject) => {
-        console.log(`Transmitiendo: ${videoPath} -> ${SRT_OUTPUT}`);
+        console.log(`Transmitiendo: ${streamData.title} -> ${SRT_OUTPUT}`);
         
         const ffmpeg = spawn('ffmpeg', [
-            '-re',                          // Leer input a su frame rate nativo
-            '-i', videoPath,                // Input file
+            '-i', streamData.url,           // Input URL directa de YouTube
             '-c:v', 'libx264',             // Video codec
             '-preset', 'veryfast',          // Encoding preset para velocidad
             '-tune', 'zerolatency',         // Optimizar para baja latencia
             '-c:a', 'aac',                 // Audio codec
             '-b:a', '128k',                // Audio bitrate
+            '-b:v', '2000k',               // Video bitrate
+            '-maxrate', '2500k',           // Max bitrate
+            '-bufsize', '5000k',           // Buffer size
             '-f', 'mpegts',                // Output format
+            '-y',                          // Overwrite output
             SRT_OUTPUT                      // SRT destination
         ]);
 
@@ -109,11 +98,15 @@ function streamVideoToSRT(videoPath) {
         });
 
         ffmpeg.stderr.on('data', (data) => {
-            console.log(`FFmpeg stderr: ${data}`);
+            const output = data.toString();
+            // Solo mostrar líneas importantes de FFmpeg para no saturar logs
+            if (output.includes('frame=') || output.includes('error') || output.includes('Error')) {
+                console.log(`FFmpeg: ${output.trim()}`);
+            }
         });
 
         ffmpeg.on('close', (code) => {
-            console.log(`FFmpeg terminó con código: ${code}`);
+            console.log(`FFmpeg terminó con código: ${code} para: ${streamData.title}`);
             resolve(code);
         });
 
@@ -122,7 +115,8 @@ function streamVideoToSRT(videoPath) {
             reject(error);
         });
 
-        return ffmpeg;
+        // Guardar referencia para poder detenerlo
+        currentStream = ffmpeg;
     });
 }
 
@@ -150,22 +144,20 @@ async function startStreaming() {
     console.log('Iniciando streaming de videos...');
 
     try {
-        for (const url of YOUTUBE_URLS) {
-            console.log(`\n--- Procesando video ${YOUTUBE_URLS.indexOf(url) + 1}/${YOUTUBE_URLS.length} ---`);
+        for (let i = 0; i < YOUTUBE_URLS.length; i++) {
+            const url = YOUTUBE_URLS[i];
+            console.log(`\n--- Procesando video ${i + 1}/${YOUTUBE_URLS.length} ---`);
             
-            // Descargar video
-            const videoPath = await downloadVideo(url);
+            // Obtener URL de stream directo
+            const streamData = await getYouTubeStreamUrl(url);
             
-            // Transmitir video
-            await streamVideoToSRT(videoPath);
+            // Transmitir video directamente
+            await streamYouTubeToSRT(streamData);
             
-            // Limpiar archivo después de transmitir
-            if (fs.existsSync(videoPath)) {
-                fs.unlinkSync(videoPath);
-                console.log(`Archivo eliminado: ${videoPath}`);
-            }
+            console.log(`Video "${streamData.title}" transmitido exitosamente\n`);
             
-            console.log('Video transmitido exitosamente\n');
+            // Pequeña pausa entre videos
+            await new Promise(resolve => setTimeout(resolve, 2000));
         }
         
         console.log('Todos los videos han sido transmitidos');
@@ -174,7 +166,8 @@ async function startStreaming() {
         console.error('Error durante el streaming:', error);
     } finally {
         isStreaming = false;
-        cleanupTempFiles();
+        currentStream = null;
+        console.log('Streaming finalizado');
     }
 }
 
