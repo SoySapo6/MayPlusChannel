@@ -1,7 +1,7 @@
 {
-  "name": "youtube-srt-streamer",
+  "name": "youtube-srt-streaming",
   "version": "1.0.0",
-  "description": "Stream YouTube videos to SRT endpoint",
+  "description": "Servidor Node.js para transmitir videos de YouTube via SRT",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -9,14 +9,7 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "ytdl-core": "^4.11.5",
-    "node-fetch": "^2.6.7"
-  },
-  "engines": {
-    "node": ">=16.0.0"
-  },
-  "environment": {
-    "YTDL_NO_UPDATE": "true"
+    "axios": "^1.6.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
@@ -28,8 +21,9 @@
     "youtube",
     "streaming",
     "srt",
-    "livepeer"
+    "livepeer",
+    "nodejs"
   ],
-  "author": "",
+  "author": "Tu nombre",
   "license": "MIT"
 }
