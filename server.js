@@ -1,14 +1,14 @@
 const express = require('express');
+const ytdl = require('ytdl-core');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const ytdl = require('ytdl-core');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-// URLs de YouTube
-const YOUTUBE_URLS = [
+// Lista de videos de YouTube
+const videoUrls = [
     'https://youtu.be/BR3NFEXuSv0?si=mSCaAzM4r6NjbC5L',
     'https://youtu.be/XOt3Rgs-tt0?si=RU86-8VqLKJ3TH60',
     'https://youtu.be/nD2TZahdAJY?si=3DfZBqXeEhAsgQH8',
@@ -18,233 +18,252 @@ const YOUTUBE_URLS = [
     'https://youtu.be/rzDrGSWteZg?si=CqsE3ffZU5H0Mnyg'
 ];
 
-// URL de destino SRT
-const SRT_OUTPUT = 'srt://rtmp.livepeer.com:2935?streamid=95e4-urol-igfh-cehi';
+// URL del stream SRT
+const SRT_URL = 'srt://rtmp.livepeer.com:2935?streamid=95e4-urol-igfh-cehi';
 
-// Directorio temporal para videos
-const TEMP_DIR = './temp_videos';
-
-// Crear directorio temporal si no existe
-if (!fs.existsSync(TEMP_DIR)) {
-    fs.mkdirSync(TEMP_DIR);
-}
-
-let currentStream = null;
+let currentVideoIndex = 0;
 let isStreaming = false;
+let streamProcess = null;
 
-// Función para limpiar el nombre del archivo
-function sanitizeFilename(filename) {
-    return filename.replace(/[^\w\s-]/g, '').replace(/\s+/g, '_');
+// Función para extraer video ID de URL de YouTube
+function extractVideoId(url) {
+    const regex = /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([^&\n?#]+)/;
+    const match = url.match(regex);
+    return match ? match[1] : null;
 }
 
-// Función para obtener URL de stream directo de YouTube
-async function getYouTubeStreamUrl(url) {
+// Función para obtener información del video
+async function getVideoInfo(url) {
     try {
-        console.log(`Obteniendo stream URL para: ${url}`);
-        
-        // Validar y limpiar URL
-        const videoId = ytdl.getVideoID(url);
-        const info = await ytdl.getInfo(videoId);
-        
-        // Buscar formato de video apropiado (720p o menor)
-        const formats = ytdl.filterFormats(info.formats, 'videoandaudio');
-        let selectedFormat = formats.find(format => 
-            format.height && format.height <= 720 && format.height >= 480
-        ) || formats.find(format => 
-            format.qualityLabel && format.qualityLabel.includes('720p')
-        ) || formats[0]; // Fallback al primer formato disponible
-        
-        if (!selectedFormat) {
-            throw new Error('No se encontró formato de video compatible');
-        }
-        
-        console.log(`Formato seleccionado: ${selectedFormat.qualityLabel || 'Desconocido'}`);
-        console.log(`URL de stream obtenida exitosamente`);
-        
+        const info = await ytdl.getInfo(url);
         return {
-            url: selectedFormat.url,
             title: info.videoDetails.title,
-            duration: info.videoDetails.lengthSeconds
+            duration: info.videoDetails.lengthSeconds,
+            formats: info.formats
         };
-        
     } catch (error) {
-        console.error(`Error obteniendo stream URL: ${error.message}`);
-        throw error;
+        console.error('Error obteniendo info del video:', error);
+        return null;
     }
 }
 
-// Función para transmitir video directamente desde YouTube a SRT
-function streamYouTubeToSRT(streamData) {
-    return new Promise((resolve, reject) => {
-        console.log(`Transmitiendo: ${streamData.title} -> ${SRT_OUTPUT}`);
-        
-        const ffmpeg = spawn('ffmpeg', [
-            '-i', streamData.url,           // Input URL directa de YouTube
-            '-c:v', 'libx264',             // Video codec
-            '-preset', 'veryfast',          // Encoding preset para velocidad
-            '-tune', 'zerolatency',         // Optimizar para baja latencia
-            '-c:a', 'aac',                 // Audio codec
-            '-b:a', '128k',                // Audio bitrate
-            '-b:v', '2000k',               // Video bitrate
-            '-maxrate', '2500k',           // Max bitrate
-            '-bufsize', '5000k',           // Buffer size
-            '-f', 'mpegts',                // Output format
-            '-y',                          // Overwrite output
-            SRT_OUTPUT                      // SRT destination
-        ]);
-
-        ffmpeg.stdout.on('data', (data) => {
-            console.log(`FFmpeg stdout: ${data}`);
-        });
-
-        ffmpeg.stderr.on('data', (data) => {
-            const output = data.toString();
-            // Solo mostrar líneas importantes de FFmpeg para no saturar logs
-            if (output.includes('frame=') || output.includes('error') || output.includes('Error')) {
-                console.log(`FFmpeg: ${output.trim()}`);
-            }
-        });
-
-        ffmpeg.on('close', (code) => {
-            console.log(`FFmpeg terminó con código: ${code} para: ${streamData.title}`);
-            resolve(code);
-        });
-
-        ffmpeg.on('error', (error) => {
-            console.error(`Error en FFmpeg: ${error}`);
-            reject(error);
-        });
-
-        // Guardar referencia para poder detenerlo
-        currentStream = ffmpeg;
-    });
-}
-
-// Función para limpiar archivos temporales
-function cleanupTempFiles() {
-    try {
-        const files = fs.readdirSync(TEMP_DIR);
-        files.forEach(file => {
-            fs.unlinkSync(path.join(TEMP_DIR, file));
-        });
-        console.log('Archivos temporales limpiados');
-    } catch (error) {
-        console.error('Error limpiando archivos temporales:', error);
-    }
-}
-
-// Función principal para procesar todos los videos
+// Función principal de streaming
 async function startStreaming() {
     if (isStreaming) {
-        console.log('Ya hay un stream en proceso');
+        console.log('Ya hay un stream en progreso');
         return;
     }
 
     isStreaming = true;
-    console.log('Iniciando streaming de videos...');
+    console.log('Iniciando streaming...');
 
-    try {
-        for (let i = 0; i < YOUTUBE_URLS.length; i++) {
-            const url = YOUTUBE_URLS[i];
-            console.log(`\n--- Procesando video ${i + 1}/${YOUTUBE_URLS.length} ---`);
-            
-            // Obtener URL de stream directo
-            const streamData = await getYouTubeStreamUrl(url);
-            
-            // Transmitir video directamente
-            await streamYouTubeToSRT(streamData);
-            
-            console.log(`Video "${streamData.title}" transmitido exitosamente\n`);
-            
-            // Pequeña pausa entre videos
-            await new Promise(resolve => setTimeout(resolve, 2000));
+    while (isStreaming) {
+        const currentUrl = videoUrls[currentVideoIndex];
+        console.log(`Streaming video ${currentVideoIndex + 1}/${videoUrls.length}: ${currentUrl}`);
+
+        try {
+            const videoInfo = await getVideoInfo(currentUrl);
+            if (!videoInfo) {
+                console.error('No se pudo obtener información del video, saltando...');
+                nextVideo();
+                continue;
+            }
+
+            console.log(`Título: ${videoInfo.title}`);
+            console.log(`Duración: ${videoInfo.duration} segundos`);
+
+            // Obtener el stream de video
+            const videoStream = ytdl(currentUrl, {
+                quality: 'highest',
+                filter: format => format.container === 'mp4' && format.hasVideo && format.hasAudio
+            });
+
+            // Crear proceso de streaming usando node-srt (alternativa a ffmpeg)
+            await streamVideo(videoStream, videoInfo.duration);
+
+        } catch (error) {
+            console.error('Error en el streaming:', error);
         }
+
+        nextVideo();
         
-        console.log('Todos los videos han sido transmitidos');
-        
-    } catch (error) {
-        console.error('Error durante el streaming:', error);
-    } finally {
-        isStreaming = false;
-        currentStream = null;
-        console.log('Streaming finalizado');
+        // Pequeña pausa entre videos
+        await new Promise(resolve => setTimeout(resolve, 2000));
     }
 }
 
-// Función para detener el stream actual
-function stopStreaming() {
-    if (currentStream) {
-        currentStream.kill();
-        currentStream = null;
+// Función para hacer stream del video usando una alternativa a ffmpeg
+function streamVideo(videoStream, duration) {
+    return new Promise((resolve, reject) => {
+        // Usar gstreamer como alternativa a ffmpeg (más común en sistemas cloud)
+        const gstCommand = [
+            'gst-launch-1.0',
+            '-v',
+            'fdsrc', 'fd=0',
+            '!', 'decodebin',
+            '!', 'videoconvert',
+            '!', 'x264enc', 'tune=zerolatency', 'bitrate=2500',
+            '!', 'mpegtsmux',
+            '!', 'srtsink', `uri=${SRT_URL}`
+        ];
+
+        // Si gstreamer no está disponible, usar una implementación básica con Node.js
+        if (!isGStreamerAvailable()) {
+            console.log('GStreamer no disponible, usando implementación básica...');
+            return streamWithNodeSRT(videoStream, duration, resolve, reject);
+        }
+
+        streamProcess = spawn('gst-launch-1.0', gstCommand.slice(1), {
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        // Pipe del video stream al proceso
+        videoStream.pipe(streamProcess.stdin);
+
+        streamProcess.on('close', (code) => {
+            console.log(`Proceso de stream terminado con código ${code}`);
+            resolve();
+        });
+
+        streamProcess.on('error', (error) => {
+            console.error('Error en el proceso de stream:', error);
+            reject(error);
+        });
+
+        // Timeout basado en la duración del video
+        setTimeout(() => {
+            if (streamProcess) {
+                streamProcess.kill();
+            }
+            resolve();
+        }, (parseInt(duration) + 5) * 1000);
+    });
+}
+
+// Implementación básica usando sockets para SRT (fallback)
+function streamWithNodeSRT(videoStream, duration, resolve, reject) {
+    const net = require('net');
+    const url = require('url');
+    
+    try {
+        // Parse SRT URL
+        const parsedUrl = url.parse(SRT_URL.replace('srt://', 'tcp://'));
+        const host = parsedUrl.hostname;
+        const port = parsedUrl.port;
+        
+        const socket = net.createConnection(port, host, () => {
+            console.log('Conectado al servidor SRT');
+            
+            // Pipe video stream al socket
+            videoStream.pipe(socket);
+        });
+
+        socket.on('error', (error) => {
+            console.error('Error de conexión SRT:', error);
+            reject(error);
+        });
+
+        socket.on('close', () => {
+            console.log('Conexión SRT cerrada');
+            resolve();
+        });
+
+        // Timeout
+        setTimeout(() => {
+            socket.destroy();
+            resolve();
+        }, (parseInt(duration) + 5) * 1000);
+
+    } catch (error) {
+        console.error('Error en streaming básico:', error);
+        reject(error);
     }
-    isStreaming = false;
-    cleanupTempFiles();
-    console.log('Streaming detenido');
+}
+
+// Verificar si GStreamer está disponible
+function isGStreamerAvailable() {
+    try {
+        const { execSync } = require('child_process');
+        execSync('which gst-launch-1.0', { stdio: 'ignore' });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+// Función para pasar al siguiente video
+function nextVideo() {
+    currentVideoIndex = (currentVideoIndex + 1) % videoUrls.length;
 }
 
 // Rutas de la API
 app.get('/', (req, res) => {
     res.json({
-        message: 'YouTube to SRT Streaming Server',
-        status: isStreaming ? 'streaming' : 'idle',
-        videos: YOUTUBE_URLS.length,
-        destination: SRT_OUTPUT
+        status: isStreaming ? 'streaming' : 'stopped',
+        currentVideo: currentVideoIndex + 1,
+        totalVideos: videoUrls.length,
+        currentUrl: videoUrls[currentVideoIndex]
     });
 });
 
-app.post('/start', (req, res) => {
+app.post('/start', async (req, res) => {
     if (isStreaming) {
-        return res.json({ 
-            success: false, 
-            message: 'Ya hay un stream en proceso' 
-        });
+        return res.json({ message: 'Stream ya está activo' });
     }
-
+    
     startStreaming();
-    res.json({ 
-        success: true, 
-        message: 'Streaming iniciado' 
-    });
+    res.json({ message: 'Stream iniciado' });
 });
 
 app.post('/stop', (req, res) => {
-    stopStreaming();
+    isStreaming = false;
+    if (streamProcess) {
+        streamProcess.kill();
+        streamProcess = null;
+    }
+    res.json({ message: 'Stream detenido' });
+});
+
+app.post('/next', (req, res) => {
+    if (streamProcess) {
+        streamProcess.kill();
+    }
+    nextVideo();
     res.json({ 
-        success: true, 
-        message: 'Streaming detenido' 
+        message: 'Cambiando al siguiente video',
+        nextVideo: currentVideoIndex + 1,
+        nextUrl: videoUrls[currentVideoIndex]
     });
 });
 
-app.get('/status', (req, res) => {
+app.get('/playlist', (req, res) => {
     res.json({
-        isStreaming,
-        currentVideo: isStreaming ? 'En proceso...' : 'Ninguno',
-        totalVideos: YOUTUBE_URLS.length
+        videos: videoUrls.map((url, index) => ({
+            index: index + 1,
+            url: url,
+            active: index === currentVideoIndex
+        }))
     });
 });
 
-// Manejo de señales para limpieza
-process.on('SIGINT', () => {
-    console.log('\nRecibida señal SIGINT, cerrando servidor...');
-    stopStreaming();
-    process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-    console.log('\nRecibida señal SIGTERM, cerrando servidor...');
-    stopStreaming();
-    process.exit(0);
-});
-
+// Iniciar servidor
 app.listen(PORT, () => {
-    console.log(`Servidor ejecutándose en http://localhost:${PORT}`);
-    console.log(`Destino SRT: ${SRT_OUTPUT}`);
-    console.log(`Videos a procesar: ${YOUTUBE_URLS.length}`);
-    console.log('\nEndpoints disponibles:');
-    console.log('  GET  / - Información del servidor');
-    console.log('  POST /start - Iniciar streaming');
-    console.log('  POST /stop - Detener streaming');
-    console.log('  GET  /status - Estado actual');
+    console.log(`Servidor ejecutándose en puerto ${PORT}`);
+    console.log(`Videos en playlist: ${videoUrls.length}`);
+    console.log('Endpoints disponibles:');
+    console.log('  GET  / - Estado del stream');
+    console.log('  POST /start - Iniciar stream');
+    console.log('  POST /stop - Detener stream');
+    console.log('  POST /next - Siguiente video');
+    console.log('  GET  /playlist - Ver playlist');
 });
 
-module.exports = app;
+// Manejo de cierre graceful
+process.on('SIGINT', () => {
+    console.log('Cerrando servidor...');
+    isStreaming = false;
+    if (streamProcess) {
+        streamProcess.kill();
+    }
+    process.exit();
+});
